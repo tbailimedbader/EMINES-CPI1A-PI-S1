@@ -1,158 +1,278 @@
-#include <digitalWriteFast.h>
-#include <FlexiTimer2.h>
 
-// Broches du codeur incrémental
-#define codeurPinA 2
-#define codeurPinB 3
+#include <Arduino.h>
+#include <stdlib.h>
 
-// Broches de commande du moteur
-#define pinPwm 5
-#define pinDir 7
+// ======================================================
+//                    CONFIGURATION
+// ======================================================
 
-// Paramètres mécaniques et codeur (64 ticks/tour en quadrature x4 = 16 PPR)
-const float reduction = 30.0;
-const int TICKS_PAR_TOUR_CODEUR = 64;
-const float RAD_PAR_TICK = (2.0 * PI) / (TICKS_PAR_TOUR_CODEUR * reduction);
+namespace Config {
+    constexpr uint8_t ENCODER_A = 2;
+    constexpr uint8_t ENCODER_B = 3;
 
-// Variables de mesure
-float omega = 0.0;       // Vitesse angulaire en rad/s
-float position = 0.0;    // Position angulaire en rad
+    constexpr uint8_t MOTOR_PWM = 5;
+    constexpr uint8_t MOTOR_DIR = 7;
 
-// Commande moteur (-255 à 255)
-int pwmValeur = 0;
+    constexpr float REDUCTION = 30.0f;
+    constexpr uint16_t ENCODER_TICKS = 64;
 
-// Machine à états pour la communication série
-enum SerialState { WAITING_PWM, WAITING_DIR };
-SerialState serialState = WAITING_PWM;
-int saisiPwm = 0;
+    constexpr uint32_t SAMPLE_PERIOD = 50000UL;  // µs
+    constexpr uint32_t BAUD_RATE = 115200;
 
-// Compteur d'impulsions et base de temps
-volatile long ticksCodeur = 0;
-#define delta_time_ms 50
-const float delta_time_s = delta_time_ms / 1000.0;
-volatile bool mesureDemandee = false;
+    constexpr float RAD_PER_TICK =
+        TWO_PI / (ENCODER_TICKS * REDUCTION);
+}
 
-// Prototypes
-void declencherMesure();
-void GestionInterruptionCodeurPinA();
-void GestionInterruptionCodeurPinB();
-void commandeVitesse(int pwm_mot);
+// ======================================================
+//                 VARIABLES DU SYSTEME
+// ======================================================
+
+volatile long encoderTicks = 0;
+volatile uint8_t previousState = 0;
+
+float position = 0.0f;
+float omega = 0.0f;
+
+int motorPWM = 0;
+int requestedPWM = 0;
+
+uint32_t lastMeasurement = 0;
+
+enum class InputState {
+    PWM,
+    DIRECTION
+};
+
+InputState inputState = InputState::PWM;
+
+// ======================================================
+//                  CODEUR INCREMENTAL
+// ======================================================
+
+uint8_t readEncoder() {
+    return (digitalRead(Config::ENCODER_A) << 1)
+         | digitalRead(Config::ENCODER_B);
+}
+
+void encoderISR() {
+    static const int8_t transitions[16] = {
+         0,  1, -1,  0,
+        -1,  0,  0,  1,
+         1,  0,  0, -1,
+         0, -1,  1,  0
+    };
+
+    const uint8_t currentState = readEncoder();
+
+    encoderTicks += transitions[
+        (previousState << 2) | currentState
+    ];
+
+    previousState = currentState;
+}
+
+long readAndResetTicks() {
+    noInterrupts();
+
+    const long ticks = encoderTicks;
+    encoderTicks = 0;
+
+    interrupts();
+
+    return ticks;
+}
+
+// ======================================================
+//                   COMMANDE MOTEUR
+// ======================================================
+
+void setMotor(int pwm) {
+    pwm = constrain(pwm, -255, 255);
+
+    if ((pwm < 0) != (motorPWM < 0)) {
+        analogWrite(Config::MOTOR_PWM, 0);
+    }
+
+    digitalWrite(Config::MOTOR_DIR, pwm >= 0 ? HIGH : LOW);
+    analogWrite(Config::MOTOR_PWM, abs(pwm));
+
+    motorPWM = pwm;
+}
+
+// ======================================================
+//                   MESURES PHYSIQUES
+// ======================================================
+
+void updateMeasurements() {
+    const uint32_t now = micros();
+    const uint32_t elapsed = now - lastMeasurement;
+
+    if (elapsed < Config::SAMPLE_PERIOD)
+        return;
+
+    const long ticks = readAndResetTicks();
+
+    lastMeasurement = now;
+
+    const float dt = elapsed * 1e-6f;
+    const float deltaTheta = ticks * Config::RAD_PER_TICK;
+
+    position += deltaTheta;
+    omega = deltaTheta / dt;
+
+    if (motorPWM != 0 || ticks != 0) {
+        Serial.print(F("Position: "));
+        Serial.print(position, 3);
+
+        Serial.print(F(" rad | Omega: "));
+        Serial.print(omega, 3);
+
+        Serial.print(F(" rad/s | Sens: "));
+
+        if (ticks > 0)
+            Serial.println(F("Positif"));
+        else if (ticks < 0)
+            Serial.println(F("Negatif"));
+        else
+            Serial.println(F("Immobilite"));
+    }
+}
+
+// ======================================================
+//                  COMMUNICATION SERIE
+// ======================================================
+
+void printPrompt() {
+    if (inputState == InputState::PWM)
+        Serial.println(F("Entrer le PWM [0-255] :"));
+    else
+        Serial.println(F("Sens [1 = Horaire, 0 = Anti-horaire] :"));
+}
+
+void processInput(long value) {
+    switch (inputState) {
+
+        case InputState::PWM:
+
+            if (value < 0 || value > 255) {
+                Serial.println(F("Erreur : PWM invalide."));
+                break;
+            }
+
+            requestedPWM = static_cast<int>(value);
+
+            if (requestedPWM == 0) {
+                setMotor(0);
+                Serial.println(F("Moteur arrete."));
+            } else {
+                inputState = InputState::DIRECTION;
+            }
+
+            break;
+
+        case InputState::DIRECTION:
+
+            if (value != 0 && value != 1) {
+                Serial.println(F("Erreur : sens invalide."));
+                break;
+            }
+
+            setMotor(value == 1 ? requestedPWM : -requestedPWM);
+
+            Serial.print(F("Commande appliquee : "));
+            Serial.println(motorPWM);
+
+            inputState = InputState::PWM;
+
+            break;
+    }
+
+    printPrompt();
+}
+
+void handleSerial() {
+    static char buffer[12];
+    static uint8_t index = 0;
+    static bool overflow = false;
+
+    while (Serial.available()) {
+        const char c = Serial.read();
+
+        if (c == '\n' || c == '\r') {
+
+            if (overflow) {
+                Serial.println(F("Erreur : saisie trop longue."));
+                printPrompt();
+            }
+            else if (index > 0) {
+                buffer[index] = '\0';
+
+                char* end;
+                const long value = strtol(buffer, &end, 10);
+
+                if (end != buffer && *end == '\0')
+                    processInput(value);
+                else {
+                    Serial.println(F("Erreur : saisie invalide."));
+                    printPrompt();
+                }
+            }
+
+            index = 0;
+            overflow = false;
+        }
+        else if (!overflow) {
+            if (index < sizeof(buffer) - 1)
+                buffer[index++] = c;
+            else
+                overflow = true;
+        }
+    }
+}
+
+// ======================================================
+//                      INITIALISATION
+// ======================================================
 
 void setup() {
-  Serial.begin(115200);
-  Serial.setTimeout(20); // Évite un blocage de 1s si "Pas de fin de ligne" est sélectionné
+    Serial.begin(Config::BAUD_RATE);
 
-  pinMode(pinPwm, OUTPUT);
-  pinMode(pinDir, OUTPUT);
-  pinMode(codeurPinA, INPUT);
-  pinMode(codeurPinB, INPUT);
+    pinMode(Config::MOTOR_PWM, OUTPUT);
+    pinMode(Config::MOTOR_DIR, OUTPUT);
 
-  // Arrêt initial garanti
-  commandeVitesse(0);
+    pinMode(Config::ENCODER_A, INPUT);
+    pinMode(Config::ENCODER_B, INPUT);
 
-  attachInterrupt(digitalPinToInterrupt(codeurPinA), GestionInterruptionCodeurPinA, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(codeurPinB), GestionInterruptionCodeurPinB, CHANGE);
+    setMotor(0);
 
-  FlexiTimer2::set(delta_time_ms, declencherMesure);
-  FlexiTimer2::start();
+    previousState = readEncoder();
 
-  Serial.println("=========================================");
-  Serial.println("   CONTROLE MOTEUR - CODEUR INCREMENTAL  ");
-  Serial.println("=========================================");
-  Serial.println("Entrer la valeur du PWM (entre 0 et 255) :");
+    attachInterrupt(
+        digitalPinToInterrupt(Config::ENCODER_A),
+        encoderISR,
+        CHANGE
+    );
+
+    attachInterrupt(
+        digitalPinToInterrupt(Config::ENCODER_B),
+        encoderISR,
+        CHANGE
+    );
+
+    lastMeasurement = micros();
+
+    Serial.println(F("================================"));
+    Serial.println(F("       DC MOTOR CONTROLLER"));
+    Serial.println(F("================================"));
+
+    printPrompt();
 }
+
+// ======================================================
+//                    BOUCLE PRINCIPALE
+// ======================================================
 
 void loop() {
-  // 1. Gestion robuste de la saisie série
-  if (Serial.available() > 0) {
-    String ligne = Serial.readStringUntil('\n');
-    ligne.trim(); // Supprime \r, \n et espaces
-
-    if (ligne.length() > 0) {
-      if (serialState == WAITING_PWM) {
-        saisiPwm = constrain(ligne.toInt(), 0, 255);
-
-        Serial.print("-> PWM choisi : ");
-        Serial.println(saisiPwm);
-        Serial.println("Entrer le sens de rotation (1 pour Horaire, 0 pour Anti-horaire) :");
-        serialState = WAITING_DIR;
-      } 
-      else if (serialState == WAITING_DIR) {
-        int sens = ligne.toInt();
-        pwmValeur = (sens == 0) ? -saisiPwm : saisiPwm;
-
-        // Applique la nouvelle consigne une seule fois
-        commandeVitesse(pwmValeur);
-
-        Serial.print("-> Moteur en marche ! PWM = ");
-        Serial.print(saisiPwm);
-        Serial.println(pwmValeur >= 0 ? " | Sens : Horaire" : " | Sens : Anti-horaire");
-        Serial.println("-----------------------------------------");
-        Serial.println("Pour changer, entrer une nouvelle valeur PWM (0-255) :");
-        serialState = WAITING_PWM;
-      }
-    }
-  }
-
-  // 2. Lecture atomique des ticks
-  noInterrupts();
-  bool calculer = mesureDemandee;
-  long deltaTicks = 0;
-  if (calculer) {
-    mesureDemandee = false;
-    deltaTicks = ticksCodeur;
-    ticksCodeur = 0;
-  }
-  interrupts();
-
-  // 3. Calcul et affichage (inclut la décélération jusqu'à l'arrêt complet)
-  if (calculer && (pwmValeur != 0 || deltaTicks != 0)) {
-    float deltaRad = deltaTicks * RAD_PAR_TICK;
-    omega = deltaRad / delta_time_s;
-    position += deltaRad;
-
-    Serial.print("Position : ");
-    Serial.print(position, 2);
-    Serial.print(" rad | Omega : ");
-    Serial.print(omega, 2);
-    Serial.print(" rad/s | Sens reel : ");
-    if (deltaTicks > 0) {
-      Serial.println("Horaire");
-    } else if (deltaTicks < 0) {
-      Serial.println("Anti-horaire");
-    } else {
-      Serial.println("Arret");
-    }
-  }
-}
-
-void commandeVitesse(int pwm_mot) {
-  pwm_mot = constrain(pwm_mot, -255, 255);
-  if (pwm_mot >= 0) {
-    digitalWrite(pinDir, HIGH);
-    analogWrite(pinPwm, pwm_mot);
-  } else {
-    digitalWrite(pinDir, LOW);
-    analogWrite(pinPwm, -pwm_mot);
-  }
-}
-
-void GestionInterruptionCodeurPinA() {
-  if (digitalReadFast2(codeurPinA) == digitalReadFast2(codeurPinB)) {
-    ticksCodeur++;
-  } else {
-    ticksCodeur--;
-  }
-}
-
-void GestionInterruptionCodeurPinB() {
-  if (digitalReadFast2(codeurPinA) == digitalReadFast2(codeurPinB)) {
-    ticksCodeur--;
-  } else {
-    ticksCodeur++;
-  }
-}
-
-void declencherMesure() {
-  mesureDemandee = true;
+    handleSerial();
+    updateMeasurements();
 }
